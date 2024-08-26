@@ -4,15 +4,15 @@
 
 #include <cstdint>
 
-RgbLed::RgbLed(int pin) : _pin(pin), rmt_send(nullptr), led_data() {}
+RgbLed::RgbLed(int pin) : _pin(pin), _rmt_send(nullptr) {}
 
 bool RgbLed::begin() {
-  rmt_send = rmtInit(_pin, RMT_TX_MODE, RMT_MEM_64);
-  if (rmt_send == nullptr) {
+  _rmt_send = rmtInit(_pin, RMT_TX_MODE, RMT_MEM_64);
+  if (nullptr == _rmt_send) {
     return false;
   }
 
-  rmtSetTick(rmt_send, 100);
+  rmtSetTick(_rmt_send, 100);
 
   set(0x010101);  // white
   delay(100);
@@ -28,15 +28,17 @@ void RgbLed::set(uint32_t color) {
 }
 
 void RgbLed::write(uint8_t red_val, uint8_t green_val, uint8_t blue_val) {
-  if ((rmt_send) == nullptr) {
+  if (nullptr == _rmt_send) {
     return;
   }
 
-  // Color coding is in order RED, REEN, BLUE
-  const uint8_t colors[] = {red_val, green_val, blue_val};
   int ii = 0;
+  rmt_data_t led_data[24];
+  // Color coding is in order RED, GREEN, BLUE
+  const uint8_t colors[] = {red_val, green_val, blue_val};
   for (const auto& color : colors) {
     for (unsigned int bit = 0; bit < 8; bit++) {
+      // from esp32-hal-rgb-led.c
       if (0 != (color & (1 << (7 - bit)))) {
         // HIGH bit
         led_data[ii].level0 = 1;     // T1H
@@ -53,5 +55,5 @@ void RgbLed::write(uint8_t red_val, uint8_t green_val, uint8_t blue_val) {
       ii++;
     }
   }
-  rmtWriteBlocking(rmt_send, led_data, 24);
+  rmtWriteBlocking(_rmt_send, led_data, 24);
 }

@@ -3,6 +3,7 @@
 //: #define SERIAL_DEBUG_DISABLED
 
 #include <Arduino.h>
+#include <ArduinoBLE.h>
 #include <WString.h>
 #include <Wire.h>
 
@@ -13,8 +14,8 @@
 #include <NMEA2000.h>
 #include <NMEA2000_esp32.h>
 
-#include <esp_log.h>
 #include <ReactESP.h>
+#include <esp_log.h>
 #include <sensesp/sensors/sensor.h>
 #include <sensesp/system/lambda_consumer.h>
 #include <sensesp/system/serial_number.h>
@@ -24,12 +25,18 @@
 
 #include "RgbLed.h"
 
+#include <string>
+
 using namespace sensesp;
 
 namespace {
 
 // RGB led pin
+#if defined(ESP32_S3_FH4R2)
 constexpr gpio_num_t kRgbLedPin = GPIO_NUM_21;
+#elif defined(ESP32_S3_DEV_KIT_N8R8)
+constexpr gpio_num_t kRgbLedPin = GPIO_NUM_38;
+#endif
 
 // I2C pins
 constexpr gpio_num_t kSDAPin = GPIO_NUM_2;
@@ -41,18 +48,72 @@ constexpr gpio_num_t kCANTxPin = GPIO_NUM_12;
 
 reactesp::ReactESP app;
 
+// Local name which should pop up when scanning for BLE devices
+constexpr char BLE_LOCAL_NAME[]{"BleDemoApp"};
+
+BLEService bleDemoService("fff0");
+
+BLEUnsignedIntCharacteristic rgbLedCharacteristic("fff1", BLERead | BLEWrite);
+BLEDescriptor rgbLedDescriptor("2601", "LED RGB Color");
+
+BLEUnsignedIntCharacteristic temperatureCharacteristic("fff2",
+                                                       BLERead | BLENotify);
+BLEUnsignedIntCharacteristic pressureCharacteristic("fff3",
+                                                    BLERead | BLENotify);
+BLEUnsignedIntCharacteristic humidityCharacteristic("fff4",
+                                                    BLERead | BLENotify);
+
+void make_advertise(unsigned int temperatureValue, unsigned int pressureValue,
+                    unsigned int humidityValue) {
+  // Build advertising data packet
+  BLEAdvertisingData advData;
+
+  advData.setFlags(BLEFlagsGeneralDiscoverable | BLEFlagsBREDRNotSupported);
+
+  uint8_t mfg_data[12];
+  memcpy(&mfg_data[0], &temperatureValue, sizeof(temperatureValue));
+  memcpy(&mfg_data[4], &pressureValue, sizeof(pressureValue));
+  memcpy(&mfg_data[8], &humidityValue, sizeof(humidityValue));
+
+  advData.setManufacturerData(0x02E1, mfg_data, sizeof(mfg_data));
+
+  // Copy set parameters in the actual advertising packet
+  BLE.setAdvertisingData(advData);
+
+  // Build scan response data packet
+  BLEAdvertisingData scanData;
+  scanData.setLocalName(BLE_LOCAL_NAME);
+  BLE.setDeviceName(BLE_LOCAL_NAME);
+  // Copy set parameters in the actual scan response packet
+  BLE.setScanResponseData(scanData);
+
+  // start advertising
+  if (0 == BLE.advertise()) {
+    Serial.println(("Bluetooth® advertise failed"));
+    BLE.stopAdvertise();
+  } else {
+    Serial.println(("Bluetooth® advertise started"));
+  }
+}
+
 }  // namespace
 
 /////////////////////////////////////////////////////////////////////
 // The setup function performs one-time application initialization.
 void setup() {
 #ifndef SERIAL_DEBUG_DISABLED
+  Serial.begin(115200);
+  while (!Serial) {
+    /*no op*/
+  }
   SetupLogging(ESP_LOG_WARN);
 #endif
 
   // initialize the I2C bus
   auto *i2c = new TwoWire(0);
-  i2c->begin(kSDAPin, kSCLPin);
+  if (!i2c->begin(kSDAPin, kSCLPin)) {
+    log_e("TwoWire initialization failed!");
+  }
 
   auto *rgbLed = new RgbLed(kRgbLedPin);
   if (!rgbLed->begin()) {
@@ -64,6 +125,118 @@ void setup() {
   if (!bmp280->begin(BMP280_ADDRESS_ALT, 0x60)) {
     log_e("Adafruit BMP280 driver initialization failed!");
   }
+
+  Serial.printf("ESP32 Chip model = %s Rev %d\n", ESP.getChipModel(),
+                ESP.getChipRevision());
+  Serial.printf("This chip has %d cores\n", ESP.getChipCores());
+
+  /////////////////////////////////////////////////////////////////////
+  // RDB led blinker for testing
+
+  static unsigned int rgbLedColor = 0x040404;
+
+  reactesp::ReactESP::app->onRepeat(500, [rgbLed]() {
+    static int blue_led_state = 0;
+    if (0 == (blue_led_state++ & 1)) {
+      rgbLed->set(rgbLedColor);
+    } else {
+      rgbLed->set(0);
+    }
+  });
+
+  /////////////////////////////////////////////////////////////////////
+  // Read analog values
+
+  static unsigned int temperatureValue = 0;
+  static unsigned int pressureValue = 0;
+  static unsigned int humidityValue = 0;
+
+  reactesp::ReactESP::app->onRepeat(10000, [bmp280]() {
+    // Temperature
+    temperatureValue =
+        static_cast<unsigned int>(bmp280->readTemperature() * 100);
+
+    // Pressure
+    pressureValue = static_cast<unsigned int>(bmp280->readPressure() * 100);
+
+    // Humidity
+    humidityValue = random(10000, 50000);
+  });
+
+  /////////////////////////////////////////////////////////////////////
+  // BLE
+
+  if (0 == BLE.begin()) {
+    Serial.println("starting Bluetooth® Low Energy module failed!");
+    for (;;) {
+      /*no op*/
+    }
+  }
+  Serial.println("BT init");
+
+  delay(200);
+
+  // assign event handlers for connected, disconnected to peripheral
+  BLE.setEventHandler(BLEConnected, [](BLEDevice central) {
+    // central connected event handler
+    Serial.print("Connected event, central: ");
+    Serial.println(central.address());
+  });
+  BLE.setEventHandler(BLEDisconnected, [](BLEDevice central) {
+    // central disconnected event handler
+    Serial.print("Disconnected event, central: ");
+    Serial.println(central.address());
+  });
+
+  // assign event handlers for characteristic
+  rgbLedCharacteristic.addDescriptor(rgbLedDescriptor);
+  rgbLedCharacteristic.setEventHandler(
+      BLEWritten,
+      [](BLEDevice central, BLECharacteristic characteristic /*NOLINT*/) {
+        (void)central;
+        Serial.print("New rgbLedColor: ");
+        characteristic.readValue(rgbLedColor);
+        Serial.println(rgbLedColor, HEX);
+      });
+  // set an initial value for the characteristic
+  rgbLedCharacteristic.setValue(rgbLedColor);
+
+  // add the characteristic to the service
+  bleDemoService.addCharacteristic(rgbLedCharacteristic);
+  bleDemoService.addCharacteristic(pressureCharacteristic);
+  bleDemoService.addCharacteristic(temperatureCharacteristic);
+  bleDemoService.addCharacteristic(humidityCharacteristic);
+  // add service
+  BLE.addService(bleDemoService);
+
+  // BLE.setAppearance(0x0300);  // Generic Thermometer
+  BLE.setAppearance(0x0540);  // Generic Sensor
+
+  BLE.setPairable(1);  // enable pairing 0=disabled, 1=multi, 2=once
+
+  make_advertise(temperatureValue, pressureValue, humidityValue);
+
+  reactesp::ReactESP::app->onRepeat(10000, []() {
+    make_advertise(temperatureValue, pressureValue, humidityValue);
+  });
+
+  reactesp::ReactESP::app->onRepeat(10000, []() {
+    const BLEDevice central = BLE.central();
+    if (central && central.connected()) {
+      // Temperature
+      temperatureCharacteristic.writeValue(temperatureValue);
+      // Pressure
+      pressureCharacteristic.writeValue(pressureValue);
+      // Humidity
+      humidityCharacteristic.writeValue(humidityValue);
+    }
+  });
+
+  // // Poll for Bluetooth® Low Energy events
+  //: every 1 ms
+  reactesp::ReactESP::app->onRepeat(1, []() { BLE.poll(); });
+
+  Serial.println(("Bluetooth® device active, waiting for connections..."));
 
   /////////////////////////////////////////////////////////////////////
   // Initialize NMEA 2000 functionality
@@ -101,7 +274,7 @@ void setup() {
       2024                     // Manufacture code
   );
 
-  const unsigned long ReceivedMessages[] PROGMEM = {
+  const unsigned long ReceivedMessages[] PROGMEM /* NOLINT */ = {
       126992L,  // System Time
       129033L,  // Local Time Offset
       0         // End of list
@@ -114,16 +287,11 @@ void setup() {
   nmea2000->SetMode(tNMEA2000::N2km_NodeOnly, 72);
   nmea2000->EnableForward(false);
 #ifndef SERIAL_DEBUG_DISABLED
-#if 1  // NOTE: Used for debugging
-  nmea2000->SetMsgHandler([](const tN2kMsg &N2kMs) { N2kMs.Print(&Serial); });
-#endif
+  // NOTE: Used for debugging
+  // nmea2000->SetMsgHandler([](const tN2kMsg &N2kMs) { N2kMs.Print(&Serial);
+  // });
 #endif
   nmea2000->Open();
-
-  // No need to parse the messages at every single loop iteration; 1 ms will
-  // do
-  reactesp::ReactESP::app->onRepeat(
-      1, [nmea2000]() { nmea2000->ParseMessages(); });
 
   /////////////////////////////////////////////////////////////////////
   // Initialize the application framework
@@ -143,7 +311,8 @@ void setup() {
   // 0x1FD0C: PGN 130316 - Temperature Extended Range
 
   // Implement the N2K PGN sending.
-  auto *temperatue_sender =
+
+  auto *temperature_sender =
       new LambdaConsumer<float>([nmea2000](float temperature) {
         static unsigned char SensorsSID = 0;
         tN2kMsg N2kMsg;
@@ -160,60 +329,60 @@ void setup() {
         }
       });
 
-  auto *temperature_provider = new RepeatSensor<float>(
-      2000, [bmp280]() { return bmp280->readTemperature(); });
+  auto *temperature_provider = new RepeatSensor<float>(2000, [bmp280]() {
+    return temperatureValue; /* bmp280->readTemperature() */
+  });
 
-  temperature_provider->connect_to(temperatue_sender);
+  temperature_provider->connect_to(temperature_sender);
 
-  auto *pressure_sender =
-      new LambdaConsumer<float>([nmea2000](float pressure) {
-        static unsigned char SensorsSID = 0;
-        tN2kMsg N2kMsg;
-        SetN2kPGN130314(N2kMsg,
-                        SensorsSID,         // SID
-                        0,                  // PressureInstance
-                        N2kps_Atmospheric,  // PressureSource
-                        pressure            // actual pressure
-        );
-        nmea2000->SendMsg(N2kMsg);
-        SensorsSID++;
-        if (SensorsSID > 252) {
-          SensorsSID = 0;
-        }
-      });
+  auto *pressure_sender = new LambdaConsumer<float>([nmea2000](float pressure) {
+    static unsigned char SensorsSID = 0;
+    tN2kMsg N2kMsg;
+    SetN2kPGN130314(N2kMsg,
+                    SensorsSID,         // SID
+                    0,                  // PressureInstance
+                    N2kps_Atmospheric,  // PressureSource
+                    pressure            // actual pressure
+    );
+    nmea2000->SendMsg(N2kMsg);
+    SensorsSID++;
+    if (SensorsSID > 252) {
+      SensorsSID = 0;
+    }
+  });
 
-  auto *pressure_provider = new RepeatSensor<float>(
-      2000, [bmp280]() { return bmp280->readPressure(); });
+  auto *pressure_provider = new RepeatSensor<float>(2000, [bmp280]() {
+    return pressureValue; /* bmp280->readPressure() */
+  });
 
   pressure_provider->connect_to(pressure_sender);
 
-  /////////////////////////////////////////////////////////////////////
-  // RDB led blinker for testing
-
-  reactesp::ReactESP::app->onRepeat(1000, [rgbLed]() {
-    static int blue_led_state = 0;
-    switch (blue_led_state) {
-      default:
-        blue_led_state = 0;
-        // fallthrough
-      case 0:
-        rgbLed->set(0x000000);  // off
-        break;
-      case 1:
-        rgbLed->set(0x040404);  // white
-        break;
-      case 2:
-        rgbLed->set(0x040000);  // red
-        break;
-      case 3:
-        rgbLed->set(0x000400);  // green
-        break;
-      case 4:
-        rgbLed->set(0x000004);  // blue
-        break;
+  auto *humidity_sender = new LambdaConsumer<float>([nmea2000](float humidity) {
+    static unsigned char SensorsSID = 0;
+    tN2kMsg N2kMsg;
+    SetN2kPGN130313(N2kMsg,
+                    SensorsSID,             // SID
+                    0,                      // humidityInstance
+                    N2khs_OutsideHumidity,  // HumiditySource
+                    humidity                // actual humidity
+    );
+    nmea2000->SendMsg(N2kMsg);
+    SensorsSID++;
+    if (SensorsSID > 252) {
+      SensorsSID = 0;
     }
-    blue_led_state++;
   });
+
+  auto *humidity_provider = new RepeatSensor<float>(2000, [bmp280]() {
+    return humidityValue; /* bmp280->readHumidity() */
+  });
+
+  humidity_provider->connect_to(humidity_sender);
+
+  // No need to parse the messages at every single loop iteration
+  //: 1 ms will do
+  reactesp::ReactESP::app->onRepeat(
+      1, [nmea2000]() { nmea2000->ParseMessages(); });
 }
 
 void loop() { app.tick(); }

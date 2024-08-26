@@ -15,9 +15,5 @@
     "C_Cpp.codeAnalysis.runAutomatically": true,
     "C_Cpp.codeAnalysis.clangTidy.useBuildPath": false,
     "C_Cpp.codeAnalysis.clangTidy.checks.disabled": [
-    ],
-    "files.associations": {
-        ".clang-tidy": "plaintext",
-        "cstdint": "cpp"
-    }
+    ]
 }

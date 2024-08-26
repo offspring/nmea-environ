@@ -11,8 +11,7 @@
 class RgbLed {
  private:
   int _pin;
-  rmt_obj_t *rmt_send;
-  rmt_data_t led_data[24];
+  rmt_obj_t *_rmt_send;
 
  public:
   RgbLed(int pin);
