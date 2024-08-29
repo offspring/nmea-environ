@@ -7,7 +7,11 @@
 #include <WString.h>
 #include <Wire.h>
 
+#ifdef USE_BMP280
 #include <Adafruit_BMP280.h>
+#else
+#include <Adafruit_BME680.h>
+#endif
 
 #include <N2kMessages.h>
 #include <N2kMsg.h>
@@ -63,17 +67,19 @@ BLEUnsignedIntCharacteristic pressureCharacteristic("fff3",
 BLEUnsignedIntCharacteristic humidityCharacteristic("fff4",
                                                     BLERead | BLENotify);
 
-void make_advertise(unsigned int temperatureValue, unsigned int pressureValue,
-                    unsigned int humidityValue) {
+void make_advertise(float temperatureValue, uint32_t pressureValue,
+                    float humidityValue) {
   // Build advertising data packet
   BLEAdvertisingData advData;
 
   advData.setFlags(BLEFlagsGeneralDiscoverable | BLEFlagsBREDRNotSupported);
 
   uint8_t mfg_data[12];
-  memcpy(&mfg_data[0], &temperatureValue, sizeof(temperatureValue));
+  const uint32_t temp = static_cast<uint32_t>(temperatureValue * 100.0);
+  memcpy(&mfg_data[0], &temp, sizeof(temp));
   memcpy(&mfg_data[4], &pressureValue, sizeof(pressureValue));
-  memcpy(&mfg_data[8], &humidityValue, sizeof(humidityValue));
+  const uint32_t humidity = static_cast<uint32_t>(humidityValue * 100.0);
+  memcpy(&mfg_data[8], &humidity, sizeof(humidity));
 
   advData.setManufacturerData(0x02E1, mfg_data, sizeof(mfg_data));
 
@@ -103,9 +109,9 @@ void make_advertise(unsigned int temperatureValue, unsigned int pressureValue,
 void setup() {
 #ifndef SERIAL_DEBUG_DISABLED
   Serial.begin(115200);
-  while (!Serial) {
-    /*no op*/
-  }
+  // while (!Serial) {
+  //   /*no op*/
+  // }
   SetupLogging(ESP_LOG_WARN);
 #endif
 
@@ -119,12 +125,25 @@ void setup() {
   if (!rgbLed->begin()) {
     log_e("RGB LED driver initialization failed!");
   }
-
+#ifdef USE_BMP280
   auto *bmp280 = new Adafruit_BMP280(i2c);
   // 0x60 for BME280
   if (!bmp280->begin(BMP280_ADDRESS_ALT, 0x60)) {
     log_e("Adafruit BMP280 driver initialization failed!");
   }
+#else
+  auto *bmp680 = new Adafruit_BME680(i2c);
+  // 0x60 for BME280
+  if (!bmp680->begin(BME68X_DEFAULT_ADDRESS)) {
+    log_e("Adafruit BME680 driver initialization failed!");
+  }
+  // Set up oversampling and filter initialization
+  bmp680->setTemperatureOversampling(BME680_OS_8X);
+  bmp680->setHumidityOversampling(BME680_OS_2X);
+  bmp680->setPressureOversampling(BME680_OS_4X);
+  bmp680->setIIRFilterSize(BME680_FILTER_SIZE_3);
+  bmp680->setGasHeater(320, 150);  // 320*C for 150 ms
+#endif
 
   Serial.printf("ESP32 Chip model = %s Rev %d\n", ESP.getChipModel(),
                 ESP.getChipRevision());
@@ -133,7 +152,7 @@ void setup() {
   /////////////////////////////////////////////////////////////////////
   // RDB led blinker for testing
 
-  static unsigned int rgbLedColor = 0x040404;
+  static uint32_t rgbLedColor = 0x040404;
 
   reactesp::ReactESP::app->onRepeat(500, [rgbLed]() {
     static int blue_led_state = 0;
@@ -147,21 +166,36 @@ void setup() {
   /////////////////////////////////////////////////////////////////////
   // Read analog values
 
-  static unsigned int temperatureValue = 0;
-  static unsigned int pressureValue = 0;
-  static unsigned int humidityValue = 0;
+  static float temperatureValue = 0;
+  static uint32_t pressureValue = 0;
+  static float humidityValue = 0;
+  static uint32_t gasResistanceValue = 0;
 
+#ifdef USE_BMP280
   reactesp::ReactESP::app->onRepeat(10000, [bmp280]() {
-    // Temperature
-    temperatureValue =
-        static_cast<unsigned int>(bmp280->readTemperature() * 100);
-
-    // Pressure
-    pressureValue = static_cast<unsigned int>(bmp280->readPressure() * 100);
-
-    // Humidity
+    temperatureValue = bmp280->readTemperature();
+    pressureValue = bmp280->readPressure();
     humidityValue = random(10000, 50000);
   });
+#else
+  reactesp::ReactESP::app->onRepeat(10000, [bmp680]() {
+    if (!bmp680->performReading()) {
+      Serial.println("Failed to perform reading :(");
+      return;
+    }
+    Serial.printf("DDDD t=%f p=%d h=%f g=%d\n", bmp680->temperature,
+                  bmp680->pressure, bmp680->humidity, bmp680->gas_resistance);
+
+    // Temperature (Celsius)
+    temperatureValue = bmp680->temperature;
+    // Pressure (Pascals)
+    pressureValue = bmp680->pressure;
+    // Humidity (RH %)
+    humidityValue = bmp680->humidity;
+    // Gas resistor (ohms)
+    gasResistanceValue = bmp680->gas_resistance;
+  });
+#endif
 
   /////////////////////////////////////////////////////////////////////
   // BLE
@@ -329,9 +363,8 @@ void setup() {
         }
       });
 
-  auto *temperature_provider = new RepeatSensor<float>(2000, [bmp280]() {
-    return temperatureValue; /* bmp280->readTemperature() */
-  });
+  auto *temperature_provider =
+      new RepeatSensor<float>(2000, []() { return temperatureValue; });
 
   temperature_provider->connect_to(temperature_sender);
 
@@ -351,9 +384,8 @@ void setup() {
     }
   });
 
-  auto *pressure_provider = new RepeatSensor<float>(2000, [bmp280]() {
-    return pressureValue; /* bmp280->readPressure() */
-  });
+  auto *pressure_provider =
+      new RepeatSensor<float>(2000, []() { return pressureValue; });
 
   pressure_provider->connect_to(pressure_sender);
 
@@ -373,9 +405,8 @@ void setup() {
     }
   });
 
-  auto *humidity_provider = new RepeatSensor<float>(2000, [bmp280]() {
-    return humidityValue; /* bmp280->readHumidity() */
-  });
+  auto *humidity_provider =
+      new RepeatSensor<float>(2000, []() { return humidityValue; });
 
   humidity_provider->connect_to(humidity_sender);
 
