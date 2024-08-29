@@ -180,12 +180,9 @@ void setup() {
 #else
   reactesp::ReactESP::app->onRepeat(10000, [bmp680]() {
     if (!bmp680->performReading()) {
-      Serial.println("Failed to perform reading :(");
+      Serial.println("Failed to perform bmp680 reading");
       return;
     }
-    Serial.printf("DDDD t=%f p=%d h=%f g=%d\n", bmp680->temperature,
-                  bmp680->pressure, bmp680->humidity, bmp680->gas_resistance);
-
     // Temperature (Celsius)
     temperatureValue = bmp680->temperature;
     // Pressure (Pascals)
@@ -354,17 +351,18 @@ void setup() {
                         SensorsSID,                // SID
                         0,                         // TempInstance
                         N2kts_OutsideTemperature,  // TempSource
-                        CToKelvin(temperature)     // actual temperature
+                        temperature                // actual temperature
         );
         nmea2000->SendMsg(N2kMsg);
         SensorsSID++;
         if (SensorsSID > 252) {
           SensorsSID = 0;
         }
+        Serial.printf("DDDD temperature_sender=%f\n", temperature);
       });
 
-  auto *temperature_provider =
-      new RepeatSensor<float>(2000, []() { return temperatureValue; });
+  auto *temperature_provider = new RepeatSensor<float>(
+      2000, []() { return CToKelvin(temperatureValue); });
 
   temperature_provider->connect_to(temperature_sender);
 
@@ -382,6 +380,7 @@ void setup() {
     if (SensorsSID > 252) {
       SensorsSID = 0;
     }
+    Serial.printf("DDDD pressure_sender=%f\n", pressure);
   });
 
   auto *pressure_provider =
@@ -403,6 +402,7 @@ void setup() {
     if (SensorsSID > 252) {
       SensorsSID = 0;
     }
+    Serial.printf("DDDD humidity_sender=%f\n", humidity);
   });
 
   auto *humidity_provider =
